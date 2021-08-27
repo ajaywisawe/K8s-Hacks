@@ -1,0 +1,228 @@
+This is information from https://gist.github.hpe.com/joel-baxter/49779d99bac8953fe76396dad1dfe399 with the "experiment log" aspects removed.
+
+These steps were done with K8s 1.15.7 and Ezmeral 5.0. Some of these steps will be different (or just not applicable) for later software versions. I will try to call out such things as we go, but a certs-refresh sequence for later software should be explicitly validated.
+
+There are almost certainly better ways to do many of these steps, with less manual intervention. I'm just getting the info together here for starters.
+
+==========
+
+To check for expiring certs, you can run the following commands.
+
+For the "core" K8s certs, run this on the K8s master node:
+
+    kubeadm alpha certs check-expiration
+
+(Note that in later versions of K8s/kubeadm, the "alpha" part of that command is gone.)
+
+For kubelet client certs, run this on each K8s node:
+
+    cat /var/lib/kubelet/pki/kubelet-client-current.pem |  openssl x509 -noout -enddate
+
+For operator-related certs, run these commands on the K8s master node (or wherever you have admin kubectl creds):
+
+    # check the webhook configurations
+    kubectl get MutatingWebhookConfiguration hpecp-webhook -o jsonpath='{.webhooks[0].clientConfig.caBundle}' | base64 -d | openssl x509 -noout -enddate
+    kubectl get MutatingWebhookConfiguration kubedirector-webhook -o jsonpath='{.webhooks[0].clientConfig.caBundle}' | base64 -d | openssl x509 -noout -enddate
+    # also check the secrets used by the hpecp-agent and KD webhook services
+    kubectl -n hpecp get secret hpecp-validator-secret -o jsonpath='{.data.ca\.crt}' | base64 -d | openssl x509 -noout -enddate
+    kubectl -n hpecp get secret hpecp-validator-secret -o jsonpath='{.data.app\.crt}' | base64 -d | openssl x509 -noout -enddate
+    kubectl -n hpecp get secret kubedirector-validator-secret -o jsonpath='{.data.ca\.crt}' | base64 -d | openssl x509 -noout -enddate
+    kubectl -n hpecp get secret kubedirector-validator-secret -o jsonpath='{.data.app\.crt}' | base64 -d | openssl x509 -noout -enddate
+
+On the Ezmeral controller, the following command will check the auth proxy client cert for a K8s cluster that has a given Ezmeral K8s cluster ID. (There are various ways to find the cluster ID, for example if when looking at the cluster in the UI the URL is something like http://controller.ip.address/bdswebui/k8s/cluster-dashboard?id=/api/v2/k8scluster/62 then the cluster ID is 62.)
+
+    kubeclusterid=1  # substitute your actual cluster ID
+    cat /opt/bluedata/auth_proxy/$kubeclusterid/front-proxy-client-cert.pem | openssl x509 -noout -enddate
+
+To check the stored "admin kubeconfig" for a cluster, go to the cluster page in the UI and use the "Download Admin Kubeconfig" button. Then, on the system where you downloaded the file, use this command:
+
+    cfg_filename=my_admin_kubeconfig  # substitute the name of the downloaded file
+    cat $cfg_filename | grep client-certificate-data | cut -d' ' -f 6 | base64 -d | openssl x509 -noout -enddate
+
+Note that if running that last command on macOS, the base64 part will be "base64 -D" with a capital D.
+
+==========
+
+To update core K8s certs you can run the following commands.
+
+On a K8s master node, ask kubeadm to renew everything it can:
+
+    kubeadm alpha certs renew all
+
+(Note that in later versions of K8s/kubeadm, the "alpha" part of that command is gone.)
+
+This will affect the kube-apiserver, kube-controller-manager, kube-scheduler, and etcd pods in the kube-system namespace. kube-apiserver at least needs to have its certs explicitly reloaded; not sure about the others.
+
+Deleting a pod will usually cause it to restart, but that seems to not necessarily be the case for "system" pods like kube-apiserver. You can try doing "docker restart" on each pod container. In my tests I just rebooted the entire master node where all the pods were scheduled, but that is a fairly big hammer that might not be desirable to do in production. More work needed here.
+
+If you explicitly restart pods and/or containers, check to make sure they all get back into Ready state.
+
+To check that kube-apiserver has in fact reloaded its cert, first have a look at what the new expiration date should be:
+
+    kubeadm alpha certs check-expiration
+
+Next we want to access kube-apiserver. We might as well do it through the gateway port to exercise the path that is actually going to be used.
+
+    # find current gateway/port for apiserver
+    cat /etc/kubernetes/kubelet.conf | grep server
+    # use the FQDN and port found above (instead of mip-bd-vm45.mip.storage.hpecorp.net:10000)
+    # we only care about "expire date" in the output
+    curl -k -v https://mip-bd-vm45.mip.storage.hpecorp.net:10000
+    # use the IP from the above FQDN, and the above port (instead of 16.143.20.142 and 10000)
+    # we only care about "expire date" in the output
+    curl --noproxy '*' --resolve apiserver-loopback-client:10000:16.143.20.142 -k -v https://apiserver-loopback-client:10000/healthz
+
+The expire date shown in those curl command outputs should match the expire dates shown by kubeadm for the relevant certs.
+
+Finally get our admin kubectl config on the K8s master node updated too:
+
+    cp /root/.kube/config /root/.kube/config.old
+    cp -i /etc/kubernetes/admin.conf /root/.kube/config
+    chown $(id -u):$(id -g) /root/.kube/config
+    chmod 777 /root/.kube/config
+
+==========
+
+To update the kubelet client cert on master node(s) you can run the following commands.
+
+Note that this is necessary in K8s 1.15 because in that older K8s version, kubelet certs are not automatically rotated. At some later K8s version this stopped being an issue.
+
+These steps follow https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/troubleshooting-kubeadm/#kubelet-client-cert instructions...
+
+...…except for part 5 there which this old version of kubeadm does not support. Instead, for part 5 we will manually edit the file to replace cert data with cert paths (as per https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/_print/ ).
+
+Note that there is a "kubeadm init phase kubeconfig all" command that could be used to do this on all hosts, but it requires a correct config file to be provided and touches other files besides kubelet.conf. It's probably the correct way to actually do this but needs more investigation.
+
+That said, here's an example of updating kubelet.conf on a master node:
+
+    # this conf is for node mip-bd-vm46.mip.storage.hpecorp.net
+    kubeadm alpha kubeconfig user --org system:nodes --client-name system:node:mip-bd-vm46.mip.storage.hpecorp.net > /tmp/kubelet.conf
+    # use vi and manually edit the generated file
+    # set cluster name and server to same as in the current /etc/kubernetes/kubelet.conf
+    # everything else should be same except certs 
+    vi /tmp/kubelet.conf
+    # after making changes, use diff to check that only cert stuff is different
+    diff /tmp/kubelet.conf /etc/kubernetes/kubelet.conf
+    # now move it into place
+    mv /etc/kubernetes/kubelet.conf /etc/kubernetes/kubelet.conf.bak
+    rm -f /var/lib/kubelet/pki/kubelet-client-current.pem
+    cp /tmp/kubelet.conf /etc/kubernetes/kubelet.conf
+
+(Note that in later versions of K8s/kubeadm, the "alpha" part of that "kubeadm alpha kubeconfig user" command is gone.)
+
+Then restart kubelet, and wait for kubelet-client-current.pem to be regenerated.
+
+    systemctl restart kubelet
+    ls -al /var/lib/kubelet/pki/*pem
+
+Repeat that "ls" until the kubelet-client-current.pem link appears and is pointing to a new cert (in this test case, the new cert will have "2022" in its name). Should be quick.
+
+Now manually edit /etc/kubernetes/kubelet.conf as per https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/_print/ to replace the cert data at the end of the file with cert paths. I.e. the "user" section should look like this:
+
+  user:
+    client-certificate: /var/lib/kubelet/pki/kubelet-client-current.pem
+    client-key: /var/lib/kubelet/pki/kubelet-client-current.pem
+
+So let's use vi and make that edit, then restart kubelet again.
+
+    vi /etc/kubernetes/kubelet.conf
+    systemctl restart kubelet
+
+Wait for this node to become Ready:
+
+    kubectl get node
+
+To double-check the expiration date on the new client cert:
+
+    cat /var/lib/kubelet/pki/kubelet-client-current.pem |  openssl x509 -noout -enddate
+
+==========
+
+Updating the kubelet client cert on worker node(s) is very similar to the steps above. However, the initial "kubeadm alpha kubeconfig user" command must be run on a master node, although be sure to specify the correct node name for the worker node you are intending to update.
+
+Once the file has been generated, you can move it to "/tmp/kubelet.conf" on the target worker node, then switch to a terminal on that worker node and do the remaining steps.
+
+At the "diff" step on the worker nodes, I observed there were more diffs between old and new kubelet.confs in what the cluster and context was named. I don't actually think this matters though, as those should just be internally consistent references in the config.
+
+==========
+
+To update operator certs you can run the following commands.
+
+On the K8s master node (or wherever you have admin kubectl creds):
+
+    kubectl delete MutatingWebhookConfiguration hpecp-webhook
+    kubectl -n hpecp delete secret hpecp-validator-secret
+    kubectl -n hpecp delete pod -l name=hpecp-agent
+    kubectl delete MutatingWebhookConfiguration kubedirector-webhook
+    kubectl -n hpecp delete secret kubedirector-validator-secret
+    kubectl -n hpecp delete pod -l name=kubedirector
+
+Once the two operator pods have come back into Ready state, you can re-check the expiration date on the new certs:
+
+    kubectl get MutatingWebhookConfiguration hpecp-webhook -o jsonpath='{.webhooks[0].clientConfig.caBundle}' | base64 -d | openssl x509 -noout -enddate
+    kubectl get MutatingWebhookConfiguration kubedirector-webhook -o jsonpath='{.webhooks[0].clientConfig.caBundle}' | base64 -d | openssl x509 -noout -enddate
+    kubectl -n hpecp get secret hpecp-validator-secret -o jsonpath='{.data.ca\.crt}' | base64 -d | openssl x509 -noout -enddate
+    kubectl -n hpecp get secret hpecp-validator-secret -o jsonpath='{.data.app\.crt}' | base64 -d | openssl x509 -noout -enddate
+    kubectl -n hpecp get secret kubedirector-validator-secret -o jsonpath='{.data.ca\.crt}' | base64 -d | openssl x509 -noout -enddate
+    kubectl -n hpecp get secret kubedirector-validator-secret -o jsonpath='{.data.app\.crt}' | base64 -d | openssl x509 -noout -enddate
+
+==========
+
+To update any stale K8s credentials stored on the Ezmeral controller, we'll need to work in a terminal on the current active Ezmeral controller.
+
+As mentioned at the top of this doc, we need to know the ID of the K8s cluster we're fixing.
+
+In Ezmeral 5.0 (not in later releases) we also need to know the auth proxy port for that cluster, in order to restart the auth proxy. One way to determine this is to do this on the active Ezmeral controller:
+
+[root@mip-bd-vm44 ~]# kubeclusterid=1  # substitute your actual cluster ID
+[root@mip-bd-vm44 ~]# grep listen /opt/bluedata/auth_proxy/$kubeclusterid/nginx.conf
+        listen 9500 ssl http2 default_server;
+
+So in this example the auth proxy port is 9500.
+
+The remaining commands are done in the Erlang console of the active controller. Working in the Erlang console is not ideal and so we should think of a different way to handle this -- even before implementing a nice feature/UI for this, we could do it through a shell script or escript.
+
+On the current active Ezmeral controller you can enter the Erlang console:
+
+    /opt/bluedata/common-install/bd_mgmt/bin/bd_mgmt attach
+
+Note that you will use Ctrl-D to exit the console when you are done. Also note that whenever one of the lines below ends with a period, the console may print output. You can suppress that by using commas instead of periods, until you get to the very last line (which must end with a period). But, it's nice to have some confirmation that intermediate steps are working.
+
+    f().
+
+    KubeClusterID = "1",  % A string containing the K8s cluster ID you determined.
+    AuthProxyPort = 9500, % The auth proxy port found above in the grep.
+
+    {ok, Cluster} = bd_mgmt_db_k8s:get_cluster(KubeClusterID),
+    SomeMasterIP = hd(bd_mgmt_db_k8s:get_master_host_ips(KubeClusterID)).
+
+    {ok, AdminKubeConfig} = bd_mgmt_k8s_install:fetch_kubeadm_conf(SomeMasterIP),
+    bd_mgmt_db_k8s:update_cluster_kubeconfig(Cluster, AdminKubeConfig).
+
+    {ok, ProxyClientCerts} = bd_mgmt_k8s_install:fetch_proxy_client_certs(SomeMasterIP),
+    bd_mgmt_db_k8s:update_cluster_client_certs(Cluster, ProxyClientCerts).
+
+    bd_kube_authn_proxy_starter:restart({KubeClusterID, AuthProxyPort}). % See below for Ezmeral-version differences.
+    
+    <press Ctrl-D to exit>
+
+That last command has changed form over Ezmeral releases. In Ezmeral 5.0 it is as shown. In Ezmeral 5.1 and later, it only takes KubeClusterID as its single argument.
+
+I.e. later than Ezmeral 5.0, that last command would just be: bd_kube_authn_proxy_starter:restart(KubeClusterID).
+
+==========
+
+Some quick tests:
+
+Create a new K8s tenant on that cluster, using the Ezmeral UI. Once that tenant has been created, launch a simple KD app in that tenant. Make sure it comes up and that its service endpoints are available in the UI.
+
+You can check some pod logs for errors, just be aware that you are really only concerned with errors AFTER the point where everything was fixed. Especially if some things were already expired before the fixing began.
+
+    # check apiserver logs
+    apiname=$(kubectl -n kube-system get pod -l component=kube-apiserver -o jsonpath='{.items[0].metadata.name}')
+    kubectl -n kube-system logs $apiname
+    # check operator logs
+    agentname=$(kubectl -n hpecp get pod -l name=hpecp-agent -o jsonpath='{.items[0].metadata.name}')
+    kubectl -n hpecp logs $agentname
+    kdname=$(kubectl -n hpecp get pod -l name=kubedirector -o jsonpath='{.items[0].metadata.name}')
+    kubectl -n hpecp logs $kdname
