@@ -1,0 +1,31 @@
+-	Stop kubelet on all master nodes
+-	Pick a good working master node
+-	Copy the /var/lib/etcd folder to another location for backup
+-	ps -ef | grep etcd – Capture the full output of etcd
+-	While etcd is running, using docker cp, copy the etcd binary from the docker container to base host, 
+  docker cp <containerid>:/usr/local/bin/etcd /tmp/
+-	Stop etcd container on all master nodes (using docker stop)
+-	Start /tmp/etcd on the base host, with the same parameters that was captured from ps -ef output, but add a new option --force-new-cluster, include quota size also
+
+-	Run some healthcheck in another window for etcd
+
+CERT="/etc/kubernetes/pki/etcd/peer.crt"
+KEY="/etc/kubernetes/pki/etcd/peer.key"
+CACERT="/etc/kubernetes/pki/etcd/ca.crt"
+# List all members
+ETCDCTL_API=3 etcdctl --cert $CERT --key $KEY --cacert $CACERT --endpoints https://127.0.0.1:2379 member list
+
+-	Start kubelet while etcd is running, (kubelet will also try to launch etcd pod which will fail because of bind conflict, which should be fine
+-	Edit ~/kubeadm.conf on this node to use localhost:6443
+-	Run kubectl ops to see if apiserver is responsive now
+-	Verify etcd pod spec has the new quota parameter
+-	Stop kubelet
+-	Stop docker
+-	Kill etcd binary
+-	Start docker 
+-	Start kubelet
+
+
+-	From ECP ui, remove the bad master nodes and readd again
+
+
